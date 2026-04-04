@@ -1,2 +1,4 @@
 .build/
+.deps/
 __pycache__/
+results_*.txt
