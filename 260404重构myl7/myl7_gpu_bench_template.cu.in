@@ -1,0 +1,318 @@
+#include <cuda_runtime.h>
+#include <fss/@SCHEME_HEADER@.cuh>
+#include <fss/group/uint.cuh>
+#include <fss/prg/chacha.cuh>
+
+#include <algorithm>
+#include <chrono>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <vector>
+
+constexpr int kInBits = @IN_BITS@;
+constexpr int kBout = @BOUT@;
+constexpr int kThreadsPerBlock = 256;
+[[maybe_unused]] constexpr std::uint64_t kStride = 104729ULL;
+constexpr char kSchemeName[] = "@SCHEME_NAME@";
+
+using InType = std::uint64_t;
+using GroupType = @GROUP_TYPE@;
+using PrgType = fss::prg::ChaCha<@PRG_MUL@>;
+using SchemeType = @SCHEME_TYPE@;
+
+static_assert(kInBits > 0 && kInBits <= 64);
+static_assert(kBout > 0 && kBout <= 64);
+
+__constant__ int kNonce[2] = {0x12345678, static_cast<int>(0x9abcdef0u)};
+__constant__ int4 kPayload = {1, 0, 0, 0};
+
+#define CUDA_CHECK(x)                                                        \
+    do {                                                                     \
+        cudaError_t err__ = (x);                                             \
+        if (err__ != cudaSuccess) {                                          \
+            std::fprintf(stderr,                                             \
+                "CUDA error at %s:%d: %s\n",                                 \
+                __FILE__,                                                    \
+                __LINE__,                                                    \
+                cudaGetErrorString(err__));                                  \
+            std::exit(1);                                                    \
+        }                                                                    \
+    } while (0)
+
+static std::uint64_t splitMix64(std::uint64_t x) {
+    x += 0x9e3779b97f4a7c15ULL;
+    x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
+    return x ^ (x >> 31);
+}
+
+static int4 makeSeed(std::uint64_t idx, std::uint64_t salt) {
+    const std::uint64_t a = splitMix64(idx ^ salt);
+    const std::uint64_t b = splitMix64(a + salt + 0x9e3779b97f4a7c15ULL);
+
+    return {
+        static_cast<int>(static_cast<std::uint32_t>(a)),
+        static_cast<int>(static_cast<std::uint32_t>(a >> 32)),
+        static_cast<int>(static_cast<std::uint32_t>(b)),
+        static_cast<int>(static_cast<std::uint32_t>(b >> 32) & ~1U),
+    };
+}
+
+static InType buildAlpha(std::uint64_t globalIdx) {
+@BUILD_ALPHA_BODY@
+}
+
+static InType buildQuery(std::uint64_t globalIdx, InType alpha) {
+@BUILD_QUERY_BODY@
+}
+
+static std::uint64_t expectedValue(InType x, InType alpha) {
+    return @EXPECT_EXPR@ ? 1ULL : 0ULL;
+}
+
+__global__ void genKernel(typename SchemeType::Cw *cws, const int4 *seeds0,
+    const int4 *seeds1, const InType *alphas, std::uint64_t n) {
+    const std::uint64_t tid = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x +
+        static_cast<std::uint64_t>(threadIdx.x);
+    if (tid >= n) return;
+
+    PrgType prg(kNonce);
+    SchemeType scheme{prg};
+
+    int4 seeds[2] = {seeds0[tid], seeds1[tid]};
+    scheme.Gen(cws + tid * static_cast<std::uint64_t>(kInBits + 1), seeds, alphas[tid], kPayload);
+}
+
+__global__ void evalKernel(int4 *ys, bool party, const int4 *seeds,
+    const typename SchemeType::Cw *cws, const InType *xs, std::uint64_t n) {
+    const std::uint64_t tid = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x +
+        static_cast<std::uint64_t>(threadIdx.x);
+    if (tid >= n) return;
+
+    PrgType prg(kNonce);
+    SchemeType scheme{prg};
+    ys[tid] = scheme.Eval(
+        party, seeds[tid], cws + tid * static_cast<std::uint64_t>(kInBits + 1), xs[tid]);
+}
+
+template <typename F>
+static unsigned long long measureMicros(F &&fn) {
+    const auto start = std::chrono::high_resolution_clock::now();
+    fn();
+    const auto end = std::chrono::high_resolution_clock::now();
+    return static_cast<unsigned long long>(
+        std::chrono::duration_cast<std::chrono::microseconds>(end - start).count());
+}
+
+static std::size_t estimatePerItemBytes() {
+    return sizeof(int4) * 3 + sizeof(InType) * 2 +
+        sizeof(typename SchemeType::Cw) * static_cast<std::size_t>(kInBits + 1);
+}
+
+static void printUsage(const char *prog) {
+    std::fprintf(stderr, "Usage: %s <n> [chunk_n]\n", prog);
+}
+
+static std::uint64_t chooseChunk(std::uint64_t totalN, std::uint64_t requestedChunk) {
+    std::size_t freeMem = 0;
+    std::size_t totalMem = 0;
+    CUDA_CHECK(cudaMemGetInfo(&freeMem, &totalMem));
+
+    const std::size_t usableMem = freeMem * 7 / 10;
+    const std::size_t perItemBytes = estimatePerItemBytes();
+    const std::uint64_t autoChunk = std::max<std::uint64_t>(1, usableMem / perItemBytes);
+
+    if (requestedChunk == 0) {
+        return std::min(totalN, autoChunk);
+    }
+
+    if (requestedChunk > autoChunk) {
+        std::fprintf(stderr,
+            "Requested chunk_n=%llu exceeds safe estimate %llu for current GPU memory.\n",
+            static_cast<unsigned long long>(requestedChunk),
+            static_cast<unsigned long long>(autoChunk));
+        std::exit(1);
+    }
+    return std::min(totalN, requestedChunk);
+}
+
+struct DeviceBuffers {
+    int4 *d_seeds0 = nullptr;
+    int4 *d_seeds1 = nullptr;
+    InType *d_alphas = nullptr;
+    InType *d_xs = nullptr;
+    int4 *d_ys = nullptr;
+    typename SchemeType::Cw *d_cws = nullptr;
+
+    explicit DeviceBuffers(std::size_t maxBatch) {
+        CUDA_CHECK(cudaMalloc(&d_seeds0, sizeof(int4) * maxBatch));
+        CUDA_CHECK(cudaMalloc(&d_seeds1, sizeof(int4) * maxBatch));
+        CUDA_CHECK(cudaMalloc(&d_alphas, sizeof(InType) * maxBatch));
+        CUDA_CHECK(cudaMalloc(&d_xs, sizeof(InType) * maxBatch));
+        CUDA_CHECK(cudaMalloc(&d_ys, sizeof(int4) * maxBatch));
+        CUDA_CHECK(cudaMalloc(
+            &d_cws,
+            sizeof(typename SchemeType::Cw) * static_cast<std::size_t>(kInBits + 1) * maxBatch));
+    }
+
+    ~DeviceBuffers() {
+        cudaFree(d_seeds0);
+        cudaFree(d_seeds1);
+        cudaFree(d_alphas);
+        cudaFree(d_xs);
+        cudaFree(d_ys);
+        cudaFree(d_cws);
+    }
+};
+
+static void fillBatch(std::uint64_t offset, std::size_t batch, std::vector<int4> &seeds0,
+    std::vector<int4> &seeds1, std::vector<InType> &alphas, std::vector<InType> &xs) {
+    seeds0.resize(batch);
+    seeds1.resize(batch);
+    alphas.resize(batch);
+    xs.resize(batch);
+
+    for (std::size_t i = 0; i < batch; ++i) {
+        const std::uint64_t globalIdx = offset + i;
+        const InType alpha = buildAlpha(globalIdx);
+        seeds0[i] = makeSeed(globalIdx, 0x1111111111111111ULL);
+        seeds1[i] = makeSeed(globalIdx, 0x2222222222222222ULL);
+        alphas[i] = alpha;
+        xs[i] = buildQuery(globalIdx, alpha);
+    }
+}
+
+static void validateBatch(std::uint64_t offset, const std::vector<InType> &alphas,
+    const std::vector<InType> &xs, const std::vector<int4> &y0,
+    const std::vector<int4> &y1) {
+    const std::size_t checks = std::min<std::size_t>(alphas.size(), 16);
+    for (std::size_t i = 0; i < checks; ++i) {
+        const std::uint64_t got = (GroupType::From(y0[i]) + GroupType::From(y1[i])).val;
+        const std::uint64_t want = expectedValue(xs[i], alphas[i]);
+        if (got != want) {
+            std::fprintf(stderr,
+                "Validation failed at global_idx=%llu: alpha=%llu x=%llu want=%llu got=%llu\n",
+                static_cast<unsigned long long>(offset + i),
+                static_cast<unsigned long long>(alphas[i]),
+                static_cast<unsigned long long>(xs[i]),
+                static_cast<unsigned long long>(want),
+                static_cast<unsigned long long>(got));
+            std::exit(2);
+        }
+    }
+}
+
+int main(int argc, char **argv) {
+    if (argc != 2 && argc != 3) {
+        printUsage(argv[0]);
+        return 1;
+    }
+
+    const std::uint64_t totalN = std::strtoull(argv[1], nullptr, 10);
+    const std::uint64_t requestedChunk = argc == 3 ? std::strtoull(argv[2], nullptr, 10) : 0;
+    if (totalN == 0) {
+        printUsage(argv[0]);
+        return 1;
+    }
+
+    CUDA_CHECK(cudaFree(0));
+    const std::uint64_t chunkN = chooseChunk(totalN, requestedChunk);
+    DeviceBuffers buffers(static_cast<std::size_t>(chunkN));
+
+    std::vector<int4> h_seeds0;
+    std::vector<int4> h_seeds1;
+    std::vector<InType> h_alphas;
+    std::vector<InType> h_xs;
+    std::vector<int4> h_y0;
+    std::vector<int4> h_y1;
+
+    unsigned long long keygenMicros = 0;
+    unsigned long long evalP0Micros = 0;
+    unsigned long long evalP1Micros = 0;
+    unsigned long long transferP0Micros = 0;
+    unsigned long long transferP1Micros = 0;
+
+    const auto totalStart = std::chrono::high_resolution_clock::now();
+
+    for (std::uint64_t offset = 0; offset < totalN; offset += chunkN) {
+        const std::size_t batch =
+            static_cast<std::size_t>(std::min<std::uint64_t>(chunkN, totalN - offset));
+        fillBatch(offset, batch, h_seeds0, h_seeds1, h_alphas, h_xs);
+        h_y0.resize(batch);
+        h_y1.resize(batch);
+
+        CUDA_CHECK(
+            cudaMemcpy(buffers.d_seeds0, h_seeds0.data(), sizeof(int4) * batch, cudaMemcpyHostToDevice));
+        CUDA_CHECK(
+            cudaMemcpy(buffers.d_seeds1, h_seeds1.data(), sizeof(int4) * batch, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(
+            buffers.d_alphas, h_alphas.data(), sizeof(InType) * batch, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(buffers.d_xs, h_xs.data(), sizeof(InType) * batch, cudaMemcpyHostToDevice));
+
+        const int blocks = static_cast<int>((batch + kThreadsPerBlock - 1) / kThreadsPerBlock);
+
+        keygenMicros += measureMicros([&] {
+            genKernel<<<blocks, kThreadsPerBlock>>>(
+                buffers.d_cws, buffers.d_seeds0, buffers.d_seeds1, buffers.d_alphas, batch);
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaDeviceSynchronize());
+        });
+
+        evalP0Micros += measureMicros([&] {
+            evalKernel<<<blocks, kThreadsPerBlock>>>(
+                buffers.d_ys, false, buffers.d_seeds0, buffers.d_cws, buffers.d_xs, batch);
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaDeviceSynchronize());
+        });
+
+        transferP0Micros += measureMicros([&] {
+            CUDA_CHECK(cudaMemcpy(
+                h_y0.data(), buffers.d_ys, sizeof(int4) * batch, cudaMemcpyDeviceToHost));
+        });
+
+        evalP1Micros += measureMicros([&] {
+            evalKernel<<<blocks, kThreadsPerBlock>>>(
+                buffers.d_ys, true, buffers.d_seeds1, buffers.d_cws, buffers.d_xs, batch);
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaDeviceSynchronize());
+        });
+
+        transferP1Micros += measureMicros([&] {
+            CUDA_CHECK(cudaMemcpy(
+                h_y1.data(), buffers.d_ys, sizeof(int4) * batch, cudaMemcpyDeviceToHost));
+        });
+
+        validateBatch(offset, h_alphas, h_xs, h_y0, h_y1);
+    }
+
+    const auto totalEnd = std::chrono::high_resolution_clock::now();
+    const auto totalMicros = static_cast<unsigned long long>(
+        std::chrono::duration_cast<std::chrono::microseconds>(totalEnd - totalStart).count());
+
+    std::printf(
+        "%s benchmark finished\n"
+        "  bin: %d bit\n"
+        "  bout: %d bit\n"
+        "  n: %llu elem\n"
+        "  chunk_n: %llu elem\n"
+        "  keygen: %llu us\n"
+        "  eval_p0: %llu us\n"
+        "  eval_p1: %llu us\n"
+        "  transfer_p0: %llu us\n"
+        "  transfer_p1: %llu us\n"
+        "  total: %llu us\n",
+        kSchemeName,
+        kInBits,
+        kBout,
+        static_cast<unsigned long long>(totalN),
+        static_cast<unsigned long long>(chunkN),
+        keygenMicros,
+        evalP0Micros,
+        evalP1Micros,
+        transferP0Micros,
+        transferP1Micros,
+        totalMicros);
+
+    return 0;
+}

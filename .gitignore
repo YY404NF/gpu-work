@@ -1,0 +1,14 @@
+# Private reports
+周报/
+
+# Research artifacts and generated outputs
+260404Orca批大小与性能线性增长没有起到加速作用/orca_compute_only_benchmark
+260404Orca批大小与性能线性增长没有起到加速作用/orca_*results*.json
+
+260404三个实现横向比较/build_*/
+260404三个实现横向比较/results_*.txt
+
+260404复用密钥/*_benchmark_reuse
+
+260404重构myl7/.build/
+260404重构myl7/__pycache__/
