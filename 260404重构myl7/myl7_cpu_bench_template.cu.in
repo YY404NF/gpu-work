@@ -1,0 +1,288 @@
+#include <cuda_runtime.h>
+#include <cuda/std/array>
+#include <fss/@SCHEME_HEADER@.cuh>
+#include <fss/group/uint.cuh>
+#include <fss/prg/aes128_mmo.cuh>
+
+#include <algorithm>
+#include <chrono>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <vector>
+
+#include <openssl/evp.h>
+
+constexpr int kInBits = 64;
+constexpr int kBout = 1;
+constexpr char kSchemeName[] = "@SCHEME_NAME@";
+
+using InType = std::uint64_t;
+using GroupType = fss::group::Uint<std::uint64_t, 2>;
+using PrgType = fss::prg::Aes128Mmo<@PRG_MUL@>;
+using SchemeType = @SCHEME_TYPE@;
+
+static_assert(kInBits == 64);
+static_assert(kBout == 1);
+
+static int4 kPayload = {1, 0, 0, 0};
+
+template <int mul>
+struct AesCtx {
+    cuda::std::array<EVP_CIPHER_CTX *, mul> ctxs;
+    PrgType prg;
+
+    AesCtx() : ctxs(MakeCtxs()), prg(ctxs) {}
+
+    ~AesCtx() {
+        PrgType::FreeCtxs(ctxs);
+    }
+
+private:
+    static cuda::std::array<EVP_CIPHER_CTX *, mul> MakeCtxs() {
+        unsigned char key0[16] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
+        unsigned char key1[16] = {16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1};
+        unsigned char key2[16] = {1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8};
+        unsigned char key3[16] = {8, 8, 7, 7, 6, 6, 5, 5, 4, 4, 3, 3, 2, 2, 1, 1};
+        if constexpr (mul == 2) {
+            const unsigned char *keys[2] = {key0, key1};
+            return PrgType::CreateCtxs(keys);
+        } else {
+            const unsigned char *keys[4] = {key0, key1, key2, key3};
+            return PrgType::CreateCtxs(keys);
+        }
+    }
+};
+
+static std::uint64_t splitMix64(std::uint64_t x) {
+    x += 0x9e3779b97f4a7c15ULL;
+    x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
+    return x ^ (x >> 31);
+}
+
+static int4 makeSeed(std::uint64_t idx, std::uint64_t salt) {
+    const std::uint64_t a = splitMix64(idx ^ salt);
+    const std::uint64_t b = splitMix64(a + salt + 0x9e3779b97f4a7c15ULL);
+    return {
+        static_cast<int>(static_cast<std::uint32_t>(a)),
+        static_cast<int>(static_cast<std::uint32_t>(a >> 32)),
+        static_cast<int>(static_cast<std::uint32_t>(b)),
+        static_cast<int>(static_cast<std::uint32_t>(b >> 32) & ~1U),
+    };
+}
+
+static InType buildAlpha(std::uint64_t globalIdx) {
+@BUILD_ALPHA_BODY@
+}
+
+static InType buildQuery(std::uint64_t globalIdx, InType alpha) {
+@BUILD_QUERY_BODY@
+}
+
+static std::uint64_t expectedValue(InType x, InType alpha) {
+    return @EXPECT_EXPR@ ? 1ULL : 0ULL;
+}
+
+template <typename F>
+static unsigned long long measureMicros(F &&fn) {
+    const auto start = std::chrono::high_resolution_clock::now();
+    fn();
+    const auto end = std::chrono::high_resolution_clock::now();
+    return static_cast<unsigned long long>(
+        std::chrono::duration_cast<std::chrono::microseconds>(end - start).count());
+}
+
+static void printUsage(const char *prog) {
+    std::fprintf(stderr, "Usage: %s <n> [chunk_n]\n", prog);
+}
+
+static std::uint64_t availableMemoryBytes() {
+    std::FILE *f = std::fopen("/proc/meminfo", "r");
+    if (f == nullptr) return 0;
+
+    char key[64];
+    unsigned long long value = 0;
+    char unit[32];
+    while (std::fscanf(f, "%63s %llu %31s", key, &value, unit) == 3) {
+        if (std::strcmp(key, "MemAvailable:") == 0) {
+            std::fclose(f);
+            return value * 1024ULL;
+        }
+    }
+
+    std::fclose(f);
+    return 0;
+}
+
+static std::size_t estimatePerItemBytes() {
+    return sizeof(int4) * 4 + sizeof(InType) * 2 + sizeof(typename SchemeType::Cw) * (kInBits + 1);
+}
+
+static std::uint64_t chooseChunk(std::uint64_t totalN, std::uint64_t requestedChunk) {
+    const std::uint64_t avail = availableMemoryBytes();
+    if (avail == 0) {
+        return requestedChunk == 0 ? totalN : std::min(totalN, requestedChunk);
+    }
+
+    const std::uint64_t usable = avail / 2;
+    const std::uint64_t perItem = estimatePerItemBytes();
+    const std::uint64_t autoChunk = std::max<std::uint64_t>(1, usable / perItem);
+
+    if (requestedChunk == 0) {
+        return std::min(totalN, autoChunk);
+    }
+
+    if (requestedChunk > autoChunk) {
+        std::fprintf(stderr,
+            "Requested chunk_n=%llu exceeds safe estimate %llu for current host memory.\n",
+            static_cast<unsigned long long>(requestedChunk),
+            static_cast<unsigned long long>(autoChunk));
+        std::exit(1);
+    }
+    return std::min(totalN, requestedChunk);
+}
+
+static void fillBatch(std::uint64_t offset, std::size_t batch, std::vector<int4> &seeds0,
+    std::vector<int4> &seeds1, std::vector<InType> &alphas, std::vector<InType> &xs) {
+    seeds0.resize(batch);
+    seeds1.resize(batch);
+    alphas.resize(batch);
+    xs.resize(batch);
+
+    for (std::size_t i = 0; i < batch; ++i) {
+        const std::uint64_t globalIdx = offset + i;
+        const InType alpha = buildAlpha(globalIdx);
+        seeds0[i] = makeSeed(globalIdx, 0x1111111111111111ULL);
+        seeds1[i] = makeSeed(globalIdx, 0x2222222222222222ULL);
+        alphas[i] = alpha;
+        xs[i] = buildQuery(globalIdx, alpha);
+    }
+}
+
+static void validateBatch(std::uint64_t offset, const std::vector<InType> &alphas,
+    const std::vector<InType> &xs, const std::vector<int4> &y0, const std::vector<int4> &y1) {
+    const std::size_t checks = std::min<std::size_t>(alphas.size(), 16);
+    for (std::size_t i = 0; i < checks; ++i) {
+        const std::uint64_t got = (GroupType::From(y0[i]) + GroupType::From(y1[i])).val;
+        const std::uint64_t want = expectedValue(xs[i], alphas[i]);
+        if (got != want) {
+            std::fprintf(stderr,
+                "Validation failed at global_idx=%llu: alpha=%llu x=%llu want=%llu got=%llu\n",
+                static_cast<unsigned long long>(offset + i),
+                static_cast<unsigned long long>(alphas[i]),
+                static_cast<unsigned long long>(xs[i]),
+                static_cast<unsigned long long>(want),
+                static_cast<unsigned long long>(got));
+            std::exit(2);
+        }
+    }
+}
+
+int main(int argc, char **argv) {
+    if (argc != 2 && argc != 3) {
+        printUsage(argv[0]);
+        return 1;
+    }
+
+    const std::uint64_t totalN = std::strtoull(argv[1], nullptr, 10);
+    const std::uint64_t requestedChunk = argc == 3 ? std::strtoull(argv[2], nullptr, 10) : 0;
+    if (totalN == 0) {
+        printUsage(argv[0]);
+        return 1;
+    }
+
+    const std::uint64_t chunkN = chooseChunk(totalN, requestedChunk);
+
+    std::vector<int4> h_seeds0;
+    std::vector<int4> h_seeds1;
+    std::vector<InType> h_alphas;
+    std::vector<InType> h_xs;
+    std::vector<typename SchemeType::Cw> h_cws;
+    std::vector<int4> h_y0;
+    std::vector<int4> h_y1;
+
+    unsigned long long keygenMicros = 0;
+    unsigned long long evalP0Micros = 0;
+    unsigned long long evalP1Micros = 0;
+    unsigned long long transferP0Micros = 0;
+    unsigned long long transferP1Micros = 0;
+
+    AesCtx<@PRG_MUL@> ctx;
+    SchemeType scheme{ctx.prg};
+
+    const auto totalStart = std::chrono::high_resolution_clock::now();
+
+    for (std::uint64_t offset = 0; offset < totalN; offset += chunkN) {
+        const std::size_t batch =
+            static_cast<std::size_t>(std::min<std::uint64_t>(chunkN, totalN - offset));
+        fillBatch(offset, batch, h_seeds0, h_seeds1, h_alphas, h_xs);
+        h_cws.resize(batch * static_cast<std::size_t>(kInBits + 1));
+        h_y0.resize(batch);
+        h_y1.resize(batch);
+
+        keygenMicros += measureMicros([&] {
+            for (std::size_t i = 0; i < batch; ++i) {
+                const int4 seeds[2] = {h_seeds0[i], h_seeds1[i]};
+                scheme.Gen(
+                    h_cws.data() + i * static_cast<std::size_t>(kInBits + 1),
+                    seeds,
+                    h_alphas[i],
+                    kPayload);
+            }
+        });
+
+        evalP0Micros += measureMicros([&] {
+            for (std::size_t i = 0; i < batch; ++i) {
+                h_y0[i] = scheme.Eval(
+                    false,
+                    h_seeds0[i],
+                    h_cws.data() + i * static_cast<std::size_t>(kInBits + 1),
+                    h_xs[i]);
+            }
+        });
+
+        evalP1Micros += measureMicros([&] {
+            for (std::size_t i = 0; i < batch; ++i) {
+                h_y1[i] = scheme.Eval(
+                    true,
+                    h_seeds1[i],
+                    h_cws.data() + i * static_cast<std::size_t>(kInBits + 1),
+                    h_xs[i]);
+            }
+        });
+
+        validateBatch(offset, h_alphas, h_xs, h_y0, h_y1);
+    }
+
+    const auto totalEnd = std::chrono::high_resolution_clock::now();
+    const auto totalMicros = static_cast<unsigned long long>(
+        std::chrono::duration_cast<std::chrono::microseconds>(totalEnd - totalStart).count());
+
+    std::printf(
+        "%s CPU benchmark finished\n"
+        "  bin: %d bit\n"
+        "  bout: %d bit\n"
+        "  n: %llu elem\n"
+        "  chunk_n: %llu elem\n"
+        "  keygen: %llu us\n"
+        "  eval_p0: %llu us\n"
+        "  eval_p1: %llu us\n"
+        "  transfer_p0: %llu us\n"
+        "  transfer_p1: %llu us\n"
+        "  total: %llu us\n",
+        kSchemeName,
+        kInBits,
+        kBout,
+        static_cast<unsigned long long>(totalN),
+        static_cast<unsigned long long>(chunkN),
+        keygenMicros,
+        evalP0Micros,
+        evalP1Micros,
+        transferP0Micros,
+        transferP1Micros,
+        totalMicros);
+
+    return 0;
+}

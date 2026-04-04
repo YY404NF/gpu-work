@@ -1,0 +1,4 @@
+.deps/
+build_*/
+libfss_batch_bench
+results_*.txt
