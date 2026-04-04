@@ -2,13 +2,87 @@
 import argparse
 import json
 import math
+import os
 import re
+import shutil
 import subprocess
+import tarfile
+import tempfile
+import urllib.request
 from pathlib import Path
 
 
-ROOT = Path("/home/yy404nf/FSS-Work")
-FSS_BUILD = ROOT / "FSS" / "build"
+WORKDIR = Path(__file__).resolve().parent
+ROOT = WORKDIR.parent
+FSS_TARBALL_URL = "https://codeload.github.com/YY404NF/FSS/tar.gz/refs/heads/main"
+FSS_CACHE_ROOT = Path(tempfile.gettempdir()) / "orca_fss_source"
+FSS_EXTRACT_PARENT = FSS_CACHE_ROOT / "src"
+FSS_EXTRACT_ROOT = FSS_EXTRACT_PARENT / "FSS-main"
+BUILD_ROOT = FSS_CACHE_ROOT / "build"
+
+
+def is_valid_fss_root(path: Path) -> bool:
+    return (path / "gpu" / "gpu_mem.cu").is_file() and (path / "runtime" / "standalone_runtime.h").is_file()
+
+
+def download_fss_tarball() -> Path:
+    tarball = FSS_CACHE_ROOT / "FSS-main.tar.gz"
+    FSS_CACHE_ROOT.mkdir(parents=True, exist_ok=True)
+    if not tarball.exists():
+        with urllib.request.urlopen(FSS_TARBALL_URL, timeout=60) as response, tarball.open("wb") as fout:
+            shutil.copyfileobj(response, fout)
+
+    if is_valid_fss_root(FSS_EXTRACT_ROOT):
+        return FSS_EXTRACT_ROOT
+
+    shutil.rmtree(FSS_EXTRACT_PARENT, ignore_errors=True)
+    FSS_EXTRACT_PARENT.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(tarball, "r:gz") as archive:
+        archive.extractall(FSS_EXTRACT_PARENT)
+
+    if not is_valid_fss_root(FSS_EXTRACT_ROOT):
+        raise RuntimeError(f"Downloaded tarball does not contain a usable FSS tree: {FSS_EXTRACT_ROOT}")
+    return FSS_EXTRACT_ROOT
+
+
+def resolve_fss_root(cli_value: Path | None) -> Path:
+    candidates = []
+    if cli_value is not None:
+        candidates.append(cli_value.expanduser().resolve())
+    env_value = os.environ.get("FSS_ROOT")
+    if env_value:
+        candidates.append(Path(env_value).expanduser().resolve())
+    candidates.append((ROOT / "FSS").resolve())
+    candidates.append(FSS_EXTRACT_ROOT.resolve())
+
+    for candidate in candidates:
+        if is_valid_fss_root(candidate):
+            return candidate
+
+    return download_fss_tarball()
+
+
+def compile_benchmark(fss_root: Path, source_name: str, output_name: str) -> Path:
+    BUILD_ROOT.mkdir(parents=True, exist_ok=True)
+    output = BUILD_ROOT / output_name
+    cmd = [
+        "nvcc",
+        "-O3",
+        "-m64",
+        "-std=c++17",
+        "-I",
+        str(fss_root),
+        "-Xcompiler=-O3,-w,-fpermissive,-fpic,-pthread,-fopenmp,-march=native",
+        "-lcuda",
+        "-lcudart",
+        "-lcurand",
+        str(fss_root / source_name),
+        str(fss_root / "gpu" / "gpu_mem.cu"),
+        "-o",
+        str(output),
+    ]
+    subprocess.run(cmd, cwd=WORKDIR, check=True)
+    return output
 
 
 def parse_args() -> argparse.Namespace:
@@ -36,6 +110,12 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=Path(__file__).with_name("orca_scaling_results.json"),
         help="JSON output path.",
+    )
+    parser.add_argument(
+        "--fss-root",
+        type=Path,
+        default=None,
+        help="Optional FSS source root. Defaults to $FSS_ROOT, ../FSS, or an auto-downloaded tarball cache.",
     )
     return parser.parse_args()
 
@@ -98,7 +178,7 @@ def parse_benchmark_output(text: str) -> dict:
 def run_command(cmd: list[str]) -> tuple[dict, str]:
     completed = subprocess.run(
         cmd,
-        cwd=ROOT,
+        cwd=WORKDIR,
         check=True,
         text=True,
         stdout=subprocess.PIPE,
@@ -110,9 +190,8 @@ def run_command(cmd: list[str]) -> tuple[dict, str]:
     return parsed, completed.stdout
 
 
-def run_dpf(bin_bits: int, ns: list[int]) -> list[dict]:
+def run_dpf(exe: Path, bin_bits: int, ns: list[int]) -> list[dict]:
     results = []
-    exe = FSS_BUILD / "dpf_benchmark"
     for n in ns:
         parsed, raw = run_command([str(exe), str(bin_bits), str(n)])
         layout = dpf_layout(bin_bits, n)
@@ -133,9 +212,8 @@ def run_dpf(bin_bits: int, ns: list[int]) -> list[dict]:
     return results
 
 
-def run_dcf(bin_bits: int, bout_bits: int, ns: list[int]) -> list[dict]:
+def run_dcf(exe: Path, bin_bits: int, bout_bits: int, ns: list[int]) -> list[dict]:
     results = []
-    exe = FSS_BUILD / "dcf_benchmark"
     for n in ns:
         parsed, raw = run_command([str(exe), str(bin_bits), str(bout_bits), str(n)])
         layout = dcf_layout(bin_bits, bout_bits, n)
@@ -158,16 +236,20 @@ def run_dcf(bin_bits: int, bout_bits: int, ns: list[int]) -> list[dict]:
 
 def main() -> None:
     args = parse_args()
+    fss_root = resolve_fss_root(args.fss_root)
     payload = {
+        "fss_root": str(fss_root),
         "bin": args.bin,
         "bout": args.bout,
         "n_list": args.ns,
         "results": [],
     }
+    dpf_exe = compile_benchmark(fss_root, "dpf_benchmark.cu", "dpf_benchmark")
+    dcf_exe = compile_benchmark(fss_root, "dcf_benchmark.cu", "dcf_benchmark")
     if args.mode in ("dpf", "both"):
-        payload["results"].extend(run_dpf(args.bin, args.ns))
+        payload["results"].extend(run_dpf(dpf_exe, args.bin, args.ns))
     if args.mode in ("dcf", "both"):
-        payload["results"].extend(run_dcf(args.bin, args.bout, args.ns))
+        payload["results"].extend(run_dcf(dcf_exe, args.bin, args.bout, args.ns))
 
     args.output.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
     print(f"Wrote {args.output}")

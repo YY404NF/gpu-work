@@ -14,6 +14,8 @@ using T = u64;
 namespace
 {
 
+constexpr int kBin = 64;
+
 struct UploadedDpfKey
 {
     GPUDPFKey key{};
@@ -21,31 +23,21 @@ struct UploadedDpfKey
 
 void printUsage(const char *prog)
 {
-    std::fprintf(stderr, "Usage: %s <bin> <n> <eval_iters>\n", prog);
+    std::fprintf(stderr, "Usage: %s <n> <eval_iters>\n", prog);
 }
 
-std::vector<T> buildRin(int bin, int n)
+std::vector<T> buildRin(int n)
 {
     std::vector<T> rin(n);
-    if (bin == 64)
-    {
-        for (int i = 0; i < n; ++i)
-            rin[i] = T(10) + T(2) * i;
-        return rin;
-    }
-
-    const T limit = T(1) << bin;
-    const T mask = limit - 1;
-    constexpr T kStride = 104729;
     for (int i = 0; i < n; ++i)
-        rin[i] = (T(10) + T(i) * kStride) & mask;
+        rin[i] = T(10) + T(2) * i;
     return rin;
 }
 
-std::vector<T> buildQueries(int bin, const std::vector<T> &rin)
+std::vector<T> buildQueries(const std::vector<T> &rin)
 {
     std::vector<T> x(rin.size());
-    const T limit = (bin == 64) ? ~T(0) : (T(1) << bin);
+    const T limit = ~T(0);
     for (std::size_t i = 0; i < rin.size(); ++i)
         x[i] = (i % 3 == 0 || rin[i] + 1 >= limit) ? rin[i] : (rin[i] + 1);
     return x;
@@ -222,29 +214,28 @@ void validateOutputs(
 
 int main(int argc, char **argv)
 {
-    if (argc != 4)
+    if (argc != 3)
     {
         printUsage(argv[0]);
         return 1;
     }
 
-    const int bin = std::atoi(argv[1]);
-    const int n = std::atoi(argv[2]);
-    const int evalIters = std::atoi(argv[3]);
-    if (bin <= 0 || bin > 64 || n <= 0 || evalIters <= 0)
+    const int n = std::atoi(argv[1]);
+    const int evalIters = std::atoi(argv[2]);
+    if (n <= 0 || evalIters <= 0)
     {
         printUsage(argv[0]);
         return 1;
     }
 
     gpu_mpc::standalone::Runtime runtime;
-    const auto rin = buildRin(bin, n);
-    const auto x = buildQueries(bin, rin);
+    const auto rin = buildRin(n);
+    const auto x = buildQueries(rin);
 
     const auto totalStart = std::chrono::high_resolution_clock::now();
 
     const auto keygenStart = std::chrono::high_resolution_clock::now();
-    auto [dpfKey0, dpfKey1] = gpu_mpc::standalone::generateDpfKeys(runtime, bin, rin);
+    auto [dpfKey0, dpfKey1] = gpu_mpc::standalone::generateDpfKeys(runtime, kBin, rin);
     const auto keygenEnd = std::chrono::high_resolution_clock::now();
 
     Stats uploadStats0;
@@ -306,17 +297,21 @@ int main(int argc, char **argv)
         "  keygen: %llu us\n"
         "  key_upload_p0: %llu us\n"
         "  key_upload_p1: %llu us\n"
+        "  key_upload_transfer_p0: %llu us\n"
+        "  key_upload_transfer_p1: %llu us\n"
         "  avg_eval_p0: %.2f us\n"
         "  avg_eval_p1: %.2f us\n"
         "  avg_transfer_p0: %.2f us\n"
         "  avg_transfer_p1: %.2f us\n"
         "  total: %llu us\n",
-        bin,
+        kBin,
         n,
         evalIters,
         microsBetween(keygenStart, keygenEnd),
         microsBetween(uploadP0Start, uploadP0End),
         microsBetween(uploadP1Start, uploadP1End),
+        static_cast<unsigned long long>(uploadStats0.transfer_time),
+        static_cast<unsigned long long>(uploadStats1.transfer_time),
         averageMicros(evalTimesP0),
         averageMicros(evalTimesP1),
         averageMicros(transferTimesP0),

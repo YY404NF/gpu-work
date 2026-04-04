@@ -1,12 +1,3 @@
-[submodule "fss"]
-	path = fss
-	url = https://github.com/myl7/fss
 [submodule "FSS"]
 	path = FSS
 	url = https://github.com/YY404NF/FSS.git
-[submodule "GPU-MPC"]
-	path = GPU-MPC
-	url = https://github.com/YY404NF/GPU-MPC.git
-[submodule "libfss"]
-	path = libfss
-	url = https://github.com/frankw2/libfss

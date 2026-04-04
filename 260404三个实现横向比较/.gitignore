@@ -1,2 +1,5 @@
 build_*/
+build_local_*
+build_orca_*
 results_*.txt
+.deps/

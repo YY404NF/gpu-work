@@ -14,6 +14,9 @@ using T = u64;
 namespace
 {
 
+constexpr int kBin = 64;
+constexpr int kBout = 1;
+
 struct UploadedDcfKey
 {
     dcf::GPUDCFKey key{};
@@ -21,31 +24,21 @@ struct UploadedDcfKey
 
 void printUsage(const char *prog)
 {
-    std::fprintf(stderr, "Usage: %s <bin> <bout> <n> <eval_iters>\n", prog);
+    std::fprintf(stderr, "Usage: %s <n> <eval_iters>\n", prog);
 }
 
-std::vector<T> buildRin(int bin, int n)
+std::vector<T> buildRin(int n)
 {
     std::vector<T> rin(n);
-    if (bin == 64)
-    {
-        for (int i = 0; i < n; ++i)
-            rin[i] = T(20) + T(2) * i;
-        return rin;
-    }
-
-    const T limit = T(1) << bin;
-    const T span = limit - 1;
-    constexpr T kStride = 104729;
     for (int i = 0; i < n; ++i)
-        rin[i] = T(1) + ((T(19) + T(i) * kStride) % span);
+        rin[i] = T(20) + T(2) * i;
     return rin;
 }
 
-std::vector<T> buildQueries(int bin, const std::vector<T> &rin)
+std::vector<T> buildQueries(const std::vector<T> &rin)
 {
     std::vector<T> x(rin.size());
-    const T limit = (bin == 64) ? ~T(0) : (T(1) << bin);
+    const T limit = ~T(0);
     for (std::size_t i = 0; i < rin.size(); ++i)
     {
         if (i % 4 == 0)
@@ -74,9 +67,9 @@ double averageMicros(const std::vector<unsigned long long> &values)
     return static_cast<double>(total) / static_cast<double>(values.size());
 }
 
-u64 outputMask(int bout)
+constexpr u64 outputMask()
 {
-    return (bout == 64) ? ~u64(0) : ((u64(1) << bout) - 1);
+    return 1ULL;
 }
 
 void freeParsedDcfKey(dcf::GPUDCFKey &key)
@@ -213,9 +206,7 @@ void validateOutputs(
     const UploadedDcfKey &cachedKey1,
     T *d_x,
     const std::vector<T> &rin,
-    const std::vector<T> &x,
-    int bin,
-    int bout)
+    const std::vector<T> &x)
 {
     const auto hostPacked0 = evalPackedWithHostKey(runtime, hostKey0, SERVER0, d_x);
     const auto hostPacked1 = evalPackedWithHostKey(runtime, hostKey1, SERVER1, d_x);
@@ -225,13 +216,13 @@ void validateOutputs(
     assert(hostPacked0 == cachedPacked0);
     assert(hostPacked1 == cachedPacked1);
 
-    const auto share0 = gpu_mpc::standalone::unpackPackedOutput(cachedPacked0, static_cast<int>(x.size()), bout);
-    const auto share1 = gpu_mpc::standalone::unpackPackedOutput(cachedPacked1, static_cast<int>(x.size()), bout);
-    const u64 mask = outputMask(bout);
+    const auto share0 = gpu_mpc::standalone::unpackPackedOutput(cachedPacked0, static_cast<int>(x.size()), kBout);
+    const auto share1 = gpu_mpc::standalone::unpackPackedOutput(cachedPacked1, static_cast<int>(x.size()), kBout);
+    const u64 mask = outputMask();
     for (std::size_t i = 0; i < x.size(); ++i)
     {
         const u64 combined = (share0[i] + share1[i]) & mask;
-        const bool expectedBool = (bin <= 8) ? (x[i] < rin[i]) : (x[i] <= rin[i]);
+        const bool expectedBool = (x[i] <= rin[i]);
         const u64 expected = static_cast<u64>(expectedBool);
         assert(combined == expected);
     }
@@ -241,30 +232,28 @@ void validateOutputs(
 
 int main(int argc, char **argv)
 {
-    if (argc != 5)
+    if (argc != 3)
     {
         printUsage(argv[0]);
         return 1;
     }
 
-    const int bin = std::atoi(argv[1]);
-    const int bout = std::atoi(argv[2]);
-    const int n = std::atoi(argv[3]);
-    const int evalIters = std::atoi(argv[4]);
-    if (bin <= 0 || bin > 64 || bout <= 0 || bout > 64 || n <= 0 || evalIters <= 0)
+    const int n = std::atoi(argv[1]);
+    const int evalIters = std::atoi(argv[2]);
+    if (n <= 0 || evalIters <= 0)
     {
         printUsage(argv[0]);
         return 1;
     }
 
     gpu_mpc::standalone::Runtime runtime;
-    const auto rin = buildRin(bin, n);
-    const auto x = buildQueries(bin, rin);
+    const auto rin = buildRin(n);
+    const auto x = buildQueries(rin);
 
     const auto totalStart = std::chrono::high_resolution_clock::now();
 
     const auto keygenStart = std::chrono::high_resolution_clock::now();
-    auto [dcfKey0, dcfKey1] = gpu_mpc::standalone::generateDcfKeys(runtime, bin, bout, rin, T(1), true);
+    auto [dcfKey0, dcfKey1] = gpu_mpc::standalone::generateDcfKeys(runtime, kBin, kBout, rin, T(1), true);
     const auto keygenEnd = std::chrono::high_resolution_clock::now();
 
     Stats uploadStats0;
@@ -312,7 +301,7 @@ int main(int argc, char **argv)
 
     const auto totalEnd = std::chrono::high_resolution_clock::now();
 
-    validateOutputs(runtime, dcfKey0, dcfKey1, uploadedKey0, uploadedKey1, d_x, rin, x, bin, bout);
+    validateOutputs(runtime, dcfKey0, dcfKey1, uploadedKey0, uploadedKey1, d_x, rin, x);
 
     gpuFree(d_x);
     destroyUploadedDcfKey(&uploadedKey0);
@@ -327,18 +316,22 @@ int main(int argc, char **argv)
         "  keygen: %llu us\n"
         "  key_upload_p0: %llu us\n"
         "  key_upload_p1: %llu us\n"
+        "  key_upload_transfer_p0: %llu us\n"
+        "  key_upload_transfer_p1: %llu us\n"
         "  avg_eval_p0: %.2f us\n"
         "  avg_eval_p1: %.2f us\n"
         "  avg_transfer_p0: %.2f us\n"
         "  avg_transfer_p1: %.2f us\n"
         "  total: %llu us\n",
-        bin,
-        bout,
+        kBin,
+        kBout,
         n,
         evalIters,
         microsBetween(keygenStart, keygenEnd),
         microsBetween(uploadP0Start, uploadP0End),
         microsBetween(uploadP1Start, uploadP1End),
+        static_cast<unsigned long long>(uploadStats0.transfer_time),
+        static_cast<unsigned long long>(uploadStats1.transfer_time),
         averageMicros(evalTimesP0),
         averageMicros(evalTimesP1),
         averageMicros(transferTimesP0),
