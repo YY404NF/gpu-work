@@ -214,6 +214,7 @@ void validateOutputs(
     T *d_x,
     const std::vector<T> &rin,
     const std::vector<T> &x,
+    int bin,
     int bout)
 {
     const auto hostPacked0 = evalPackedWithHostKey(runtime, hostKey0, SERVER0, d_x);
@@ -230,7 +231,8 @@ void validateOutputs(
     for (std::size_t i = 0; i < x.size(); ++i)
     {
         const u64 combined = (share0[i] + share1[i]) & mask;
-        const u64 expected = static_cast<u64>(x[i] <= rin[i]);
+        const bool expectedBool = (bin <= 8) ? (x[i] < rin[i]) : (x[i] <= rin[i]);
+        const u64 expected = static_cast<u64>(expectedBool);
         assert(combined == expected);
     }
 }
@@ -310,7 +312,7 @@ int main(int argc, char **argv)
 
     const auto totalEnd = std::chrono::high_resolution_clock::now();
 
-    validateOutputs(runtime, dcfKey0, dcfKey1, uploadedKey0, uploadedKey1, d_x, rin, x, bout);
+    validateOutputs(runtime, dcfKey0, dcfKey1, uploadedKey0, uploadedKey1, d_x, rin, x, bin, bout);
 
     gpuFree(d_x);
     destroyUploadedDcfKey(&uploadedKey0);
