@@ -78,7 +78,7 @@ extract_field() {
 format_us_value() {
   local raw="$1"
   if [[ "$raw" == ">TIMEOUT<" ]]; then
-    printf '>%s us' "$TIMEOUT_US"
+    printf '超时'
     return 0
   fi
   if [[ "$raw" == ERROR* ]]; then

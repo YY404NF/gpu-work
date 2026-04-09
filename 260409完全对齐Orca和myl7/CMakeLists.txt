@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.24)
+cmake_minimum_required(VERSION 3.18)
 
 if(NOT DEFINED CMAKE_CUDA_HOST_COMPILER AND EXISTS "/usr/bin/g++-13")
   set(CMAKE_CUDA_HOST_COMPILER "/usr/bin/g++-13" CACHE FILEPATH "CUDA host compiler")
@@ -6,10 +6,8 @@ endif()
 
 project(orca_myl7_align LANGUAGES CXX CUDA)
 
-set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CUDA_STANDARD 20)
-set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
 find_package(CUDAToolkit REQUIRED)
 find_package(OpenSSL REQUIRED)
@@ -52,19 +50,89 @@ message(STATUS "Detected CUDA toolkit version: ${CUDAToolkit_VERSION}")
 message(STATUS "Using CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")
 
 set(ORCA_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../FSS/Orca")
+if(NOT EXISTS "${ORCA_ROOT}/gpu/gpu_mem.cu")
+  set(ORCA_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/.deps/FSS/Orca")
+endif()
+
 set(MYL7_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../FSS/myl7")
+if(NOT EXISTS "${MYL7_ROOT}/include")
+  set(MYL7_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../fss")
+endif()
+if(NOT EXISTS "${MYL7_ROOT}/include")
+  set(MYL7_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/.deps/fss")
+endif()
+
 set(LIBFSS_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../libfss")
+if(NOT EXISTS "${LIBFSS_ROOT}/cpp/fss-client.cpp")
+  set(LIBFSS_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/.deps/libfss")
+endif()
+
+message(STATUS "Using ORCA root: ${ORCA_ROOT}")
+message(STATUS "Using myl7 root: ${MYL7_ROOT}")
+message(STATUS "Using libfss root: ${LIBFSS_ROOT}")
 
 function(add_common_target target_name)
   target_compile_options(${target_name} PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:-O3>
     $<$<COMPILE_LANGUAGE:CUDA>:-O3>
+    $<$<COMPILE_LANGUAGE:CUDA>:--std=c++17>
     $<$<COMPILE_LANGUAGE:CUDA>:-m64>
     $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-O3,-w,-fpermissive,-fpic,-pthread,-march=native>
   )
   if(OpenMP_CXX_FOUND)
     target_link_libraries(${target_name} PRIVATE OpenMP::OpenMP_CXX)
   endif()
+endfunction()
+
+list(GET CMAKE_CUDA_ARCHITECTURES 0 MYL7_CUDA_ARCH)
+
+function(add_myl7_gpu_target target_name source_name common_header)
+  set(output_path "${CMAKE_CURRENT_BINARY_DIR}/${target_name}")
+  set(stamp_path "${output_path}.stamp")
+  add_custom_command(
+    OUTPUT "${stamp_path}"
+    BYPRODUCTS "${output_path}"
+    COMMAND ${CUDAToolkit_NVCC_EXECUTABLE}
+      -O3
+      -std=c++20
+      --extended-lambda
+      --generate-code=arch=compute_${MYL7_CUDA_ARCH},code=sm_${MYL7_CUDA_ARCH}
+      -I"${CMAKE_CURRENT_SOURCE_DIR}"
+      -I"${MYL7_ROOT}/include"
+      "${CMAKE_CURRENT_SOURCE_DIR}/${source_name}"
+      -o "${output_path}"
+    COMMAND ${CMAKE_COMMAND} -E touch "${stamp_path}"
+    DEPENDS
+      "${CMAKE_CURRENT_SOURCE_DIR}/${source_name}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/${common_header}"
+    VERBATIM
+  )
+  add_custom_target(${target_name} ALL DEPENDS "${stamp_path}")
+endfunction()
+
+function(add_myl7_cpu_target target_name source_name common_header)
+  set(output_path "${CMAKE_CURRENT_BINARY_DIR}/${target_name}")
+  set(stamp_path "${output_path}.stamp")
+  add_custom_command(
+    OUTPUT "${stamp_path}"
+    BYPRODUCTS "${output_path}"
+    COMMAND ${CUDAToolkit_NVCC_EXECUTABLE}
+      -O3
+      -std=c++20
+      --generate-code=arch=compute_${MYL7_CUDA_ARCH},code=sm_${MYL7_CUDA_ARCH}
+      -I"${CMAKE_CURRENT_SOURCE_DIR}"
+      -I"${MYL7_ROOT}/include"
+      -Xcompiler=-maes,-msse4.2,-fopenmp
+      "${CMAKE_CURRENT_SOURCE_DIR}/${source_name}"
+      -o "${output_path}"
+      -lcrypto
+    COMMAND ${CMAKE_COMMAND} -E touch "${stamp_path}"
+    DEPENDS
+      "${CMAKE_CURRENT_SOURCE_DIR}/${source_name}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/${common_header}"
+    VERBATIM
+  )
+  add_custom_target(${target_name} ALL DEPENDS "${stamp_path}")
 endfunction()
 
 add_executable(orca_dcf_batch_keygen_bench
@@ -127,105 +195,14 @@ target_link_libraries(orca_dpf_singlekey_bench PRIVATE
 )
 add_common_target(orca_dpf_singlekey_bench)
 
-add_executable(myl7_dcf_batch_keygen_bench
-  myl7_dcf_batch_keygen_bench.cu
-)
-target_include_directories(myl7_dcf_batch_keygen_bench PRIVATE
-  "${CMAKE_CURRENT_SOURCE_DIR}"
-  "${MYL7_ROOT}/include"
-)
-target_link_libraries(myl7_dcf_batch_keygen_bench PRIVATE
-  CUDA::cudart
-)
-add_common_target(myl7_dcf_batch_keygen_bench)
-
-add_executable(myl7_dpf_batch_keygen_bench
-  myl7_dpf_batch_keygen_bench.cu
-)
-target_include_directories(myl7_dpf_batch_keygen_bench PRIVATE
-  "${CMAKE_CURRENT_SOURCE_DIR}"
-  "${MYL7_ROOT}/include"
-)
-target_link_libraries(myl7_dpf_batch_keygen_bench PRIVATE
-  CUDA::cudart
-)
-add_common_target(myl7_dpf_batch_keygen_bench)
-
-add_executable(myl7_dcf_singlekey_bench
-  myl7_dcf_singlekey_bench.cu
-)
-target_include_directories(myl7_dcf_singlekey_bench PRIVATE
-  "${CMAKE_CURRENT_SOURCE_DIR}"
-  "${MYL7_ROOT}/include"
-)
-target_link_libraries(myl7_dcf_singlekey_bench PRIVATE
-  CUDA::cudart
-)
-add_common_target(myl7_dcf_singlekey_bench)
-
-add_executable(myl7_dpf_singlekey_bench
-  myl7_dpf_singlekey_bench.cu
-)
-target_include_directories(myl7_dpf_singlekey_bench PRIVATE
-  "${CMAKE_CURRENT_SOURCE_DIR}"
-  "${MYL7_ROOT}/include"
-)
-target_link_libraries(myl7_dpf_singlekey_bench PRIVATE
-  CUDA::cudart
-)
-add_common_target(myl7_dpf_singlekey_bench)
-
-add_executable(myl7_cpu_dcf_batch_keygen_bench
-  myl7_cpu_dcf_batch_keygen_bench.cu
-)
-target_include_directories(myl7_cpu_dcf_batch_keygen_bench PRIVATE
-  "${CMAKE_CURRENT_SOURCE_DIR}"
-  "${MYL7_ROOT}/include"
-)
-target_link_libraries(myl7_cpu_dcf_batch_keygen_bench PRIVATE
-  CUDA::cudart
-  OpenSSL::Crypto
-)
-add_common_target(myl7_cpu_dcf_batch_keygen_bench)
-
-add_executable(myl7_cpu_dpf_batch_keygen_bench
-  myl7_cpu_dpf_batch_keygen_bench.cu
-)
-target_include_directories(myl7_cpu_dpf_batch_keygen_bench PRIVATE
-  "${CMAKE_CURRENT_SOURCE_DIR}"
-  "${MYL7_ROOT}/include"
-)
-target_link_libraries(myl7_cpu_dpf_batch_keygen_bench PRIVATE
-  CUDA::cudart
-  OpenSSL::Crypto
-)
-add_common_target(myl7_cpu_dpf_batch_keygen_bench)
-
-add_executable(myl7_cpu_dcf_singlekey_bench
-  myl7_cpu_dcf_singlekey_bench.cu
-)
-target_include_directories(myl7_cpu_dcf_singlekey_bench PRIVATE
-  "${CMAKE_CURRENT_SOURCE_DIR}"
-  "${MYL7_ROOT}/include"
-)
-target_link_libraries(myl7_cpu_dcf_singlekey_bench PRIVATE
-  CUDA::cudart
-  OpenSSL::Crypto
-)
-add_common_target(myl7_cpu_dcf_singlekey_bench)
-
-add_executable(myl7_cpu_dpf_singlekey_bench
-  myl7_cpu_dpf_singlekey_bench.cu
-)
-target_include_directories(myl7_cpu_dpf_singlekey_bench PRIVATE
-  "${CMAKE_CURRENT_SOURCE_DIR}"
-  "${MYL7_ROOT}/include"
-)
-target_link_libraries(myl7_cpu_dpf_singlekey_bench PRIVATE
-  CUDA::cudart
-  OpenSSL::Crypto
-)
-add_common_target(myl7_cpu_dpf_singlekey_bench)
+add_myl7_gpu_target(myl7_dcf_batch_keygen_bench myl7_dcf_batch_keygen_bench.cu dcf_bench_common.h)
+add_myl7_gpu_target(myl7_dpf_batch_keygen_bench myl7_dpf_batch_keygen_bench.cu dpf_bench_common.h)
+add_myl7_gpu_target(myl7_dcf_singlekey_bench myl7_dcf_singlekey_bench.cu dcf_bench_common.h)
+add_myl7_gpu_target(myl7_dpf_singlekey_bench myl7_dpf_singlekey_bench.cu dpf_bench_common.h)
+add_myl7_cpu_target(myl7_cpu_dcf_batch_keygen_bench myl7_cpu_dcf_batch_keygen_bench.cu dcf_bench_common.h)
+add_myl7_cpu_target(myl7_cpu_dpf_batch_keygen_bench myl7_cpu_dpf_batch_keygen_bench.cu dpf_bench_common.h)
+add_myl7_cpu_target(myl7_cpu_dcf_singlekey_bench myl7_cpu_dcf_singlekey_bench.cu dcf_bench_common.h)
+add_myl7_cpu_target(myl7_cpu_dpf_singlekey_bench myl7_cpu_dpf_singlekey_bench.cu dpf_bench_common.h)
 
 add_executable(libfss_dcf_batch_keygen_bench
   libfss_dcf_batch_keygen_bench.cu
